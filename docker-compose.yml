@@ -1,36 +1,14 @@
 version: '3.8'
 
 services:
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: dbuser
-      POSTGRES_PASSWORD: dbpassword
-      POSTGRES_DB: database_agent
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dbuser -d database_agent"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   agent:
     build: .
     environment:
-      DATABASE_URL: postgresql://dbuser:dbpassword@postgres:5432/database_agent
+      DATABASE_URL: sqlite:///database_agent.db
       LOG_LEVEL: INFO
     ports:
       - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
     volumes:
       - .:/app
       - /app/__pycache__
     command: python -m cli.main --interactive
-
-volumes:
-  postgres_data:

@@ -1,11 +1,10 @@
 """Database connection and query execution layer."""
 
 import logging
+import sqlite3
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
-import psycopg2
-from psycopg2 import pool, Error
-from psycopg2.extras import RealDictCursor
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -15,57 +14,80 @@ class DatabaseConnection:
 
     def __init__(
         self,
-        url: str,
+        url: str = None,
         min_connections: int = 2,
         max_connections: int = 10,
         timeout: int = 5,
     ):
-        """Initialize database connection pool.
+        """Initialize database connection.
 
         Args:
-            url: Database connection URL (postgresql://user:password@host:port/db)
-            min_connections: Minimum pool size
-            max_connections: Maximum pool size
+            url: Database connection URL (sqlite:///path/to/db.db)
+                Defaults to sqlite:///database_agent.db
+            min_connections: Ignored for SQLite (kept for API compatibility)
+            max_connections: Ignored for SQLite (kept for API compatibility)
             timeout: Connection timeout in seconds
         """
+        if url is None:
+            url = os.getenv("DATABASE_URL", "sqlite:///database_agent.db")
+        
         self.url = url
         self.timeout = timeout
-        self.pool = None
-        self._initialize_pool(min_connections, max_connections)
-        logger.info(f"Database connection pool initialized with {min_connections}-{max_connections} connections")
+        self.db_path = self._parse_sqlite_path(url)
+        
+        # Ensure database file exists
+        self._initialize_database()
+        logger.info(f"Database initialized at {self.db_path}")
 
-    def _initialize_pool(self, min_size: int, max_size: int) -> None:
-        """Initialize connection pool."""
-        try:
-            self.pool = psycopg2.pool.SimpleConnectionPool(
-                min_size,
-                max_size,
-                self.url,
-                connect_timeout=self.timeout,
-            )
-        except Error as e:
-            logger.error(f"Failed to initialize connection pool: {e}")
-            raise
+    def _parse_sqlite_path(self, url: str) -> str:
+        """Parse SQLite path from connection URL.
+        
+        Args:
+            url: Connection URL like sqlite:///path/to/db.db
+            
+        Returns:
+            Path to database file
+        """
+        if url.startswith("sqlite:///"):
+            return url.replace("sqlite:///", "")
+        elif url.startswith("sqlite://"):
+            return url.replace("sqlite://", "")
+        else:
+            return url
+
+    def _initialize_database(self) -> None:
+        """Initialize SQLite database and create directory if needed."""
+        # Create directory if it doesn't exist
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        
+        # Create database file if it doesn't exist
+        if not os.path.exists(self.db_path):
+            conn = sqlite3.connect(self.db_path)
+            conn.close()
+            logger.info(f"Created new SQLite database at {self.db_path}")
 
     @contextmanager
     def get_connection(self):
         """Context manager for database connections.
 
         Yields:
-            Database connection from pool
+            SQLite database connection
         """
         conn = None
         try:
-            conn = self.pool.getconn()
+            conn = sqlite3.connect(self.db_path, timeout=self.timeout)
+            conn.row_factory = sqlite3.Row  # Return rows as dictionaries
             yield conn
-        except Error as e:
+        except sqlite3.Error as e:
             logger.error(f"Database connection error: {e}")
             if conn:
                 conn.rollback()
             raise
         finally:
             if conn:
-                self.pool.putconn(conn)
+                conn.close()
 
     def execute_query(
         self,
@@ -82,15 +104,18 @@ class DatabaseConnection:
             List of dictionaries with query results
         """
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                try:
-                    cur.execute(query, params or ())
-                    results = cur.fetchall()
-                    logger.info(f"Query executed successfully, returned {len(results)} rows")
-                    return results
-                except Error as e:
-                    logger.error(f"Query execution error: {e}")
-                    raise
+            try:
+                cursor = conn.cursor()
+                cursor.execute(query, params or ())
+                results = cursor.fetchall()
+                # Convert sqlite3.Row objects to dictionaries
+                result_list = [dict(row) for row in results]
+                logger.info(f"Query executed successfully, returned {len(result_list)} rows")
+                cursor.close()
+                return result_list
+            except sqlite3.Error as e:
+                logger.error(f"Query execution error: {e}")
+                raise
 
     def execute_update(
         self,
@@ -107,17 +132,18 @@ class DatabaseConnection:
             Number of affected rows
         """
         with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                try:
-                    cur.execute(query, params or ())
-                    conn.commit()
-                    affected = cur.rowcount
-                    logger.info(f"Update executed, {affected} rows affected")
-                    return affected
-                except Error as e:
-                    conn.rollback()
-                    logger.error(f"Update execution error: {e}")
-                    raise
+            try:
+                cursor = conn.cursor()
+                cursor.execute(query, params or ())
+                conn.commit()
+                affected = cursor.rowcount
+                logger.info(f"Update executed, {affected} rows affected")
+                cursor.close()
+                return affected
+            except sqlite3.Error as e:
+                conn.rollback()
+                logger.error(f"Update execution error: {e}")
+                raise
 
     def get_table_info(self, table_name: str) -> Dict[str, Any]:
         """Get information about a table's columns and types.
@@ -128,17 +154,30 @@ class DatabaseConnection:
         Returns:
             Dictionary with table information
         """
-        query = """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = %s
-            ORDER BY ordinal_position
-        """
-        results = self.execute_query(query, [table_name])
-        return {
-            "table": table_name,
-            "columns": results,
-        }
+        query = f"PRAGMA table_info({table_name})"
+        with self.get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                columns = cursor.fetchall()
+                
+                # Convert PRAGMA results to our format
+                result = {
+                    "table": table_name,
+                    "columns": [
+                        {
+                            "column_name": col[1],
+                            "data_type": col[2],
+                            "is_nullable": "YES" if col[3] == 0 else "NO",
+                        }
+                        for col in columns
+                    ],
+                }
+                cursor.close()
+                return result
+            except sqlite3.Error as e:
+                logger.error(f"Failed to get table info: {e}")
+                raise
 
     def get_all_tables(self) -> List[str]:
         """Get list of all accessible tables.
@@ -146,20 +185,23 @@ class DatabaseConnection:
         Returns:
             List of table names
         """
-        query = """
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-            ORDER BY table_name
-        """
-        results = self.execute_query(query)
-        return [row["table_name"] for row in results]
+        query = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        with self.get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                tables = cursor.fetchall()
+                result = [table[0] for table in tables]
+                cursor.close()
+                return result
+            except sqlite3.Error as e:
+                logger.error(f"Failed to get tables: {e}")
+                raise
 
     def close(self) -> None:
-        """Close all connections in the pool."""
-        if self.pool:
-            self.pool.closeall()
-            logger.info("Connection pool closed")
+        """Close database connection."""
+        # SQLite connections are closed in the context manager
+        logger.info("Database connection closed")
 
     def __enter__(self):
         """Context manager entry."""

@@ -1,8 +1,4 @@
 # Core dependencies
-psycopg2-binary==2.9.9
-PyMySQL==1.1.0
-
-# Utilities
 python-dotenv==1.0.0
 click==8.1.7
 
@@ -12,3 +8,5 @@ pandas==2.0.3
 
 # Logging and monitoring
 python-json-logger==2.0.7
+
+# Note: SQLite is built-in with Python, no additional dependencies needed
